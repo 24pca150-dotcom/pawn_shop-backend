@@ -5,6 +5,7 @@ import Loan from '../models/Loan.js';
 import Item from '../models/Item.js';
 import Scheme from '../models/Scheme.js';
 import GoldRate from '../models/GoldRate.js';
+import Deduction from '../models/Deduction.js';
 import Payment from '../models/Payment.js';
 import SchemeRequest from '../models/SchemeRequest.js';
 import { notifyAdminsAndStaff } from '../services/notificationService.js';
@@ -53,8 +54,55 @@ const normalizeLoanPaths = (loan) => {
     return loan;
 };
 
+const calculateLoanPayables = (loan) => {
+    const today = new Date();
+    const dueDate = new Date(loan.dueDate);
+    const nextPaymentDate = new Date(loan.nextPaymentDate);
+
+    let penalty = { details: 'No penalty', amount: 0, daysOverdue: 0 };
+    let totalInterestDue = 0;
+    let monthsUnpaid = 0;
+    let interestDetails = [];
+
+    if (today >= nextPaymentDate) {
+        const yearDiff = today.getFullYear() - nextPaymentDate.getFullYear();
+        const monthDiff = today.getMonth() - nextPaymentDate.getMonth();
+        monthsUnpaid = (yearDiff * 12) + monthDiff;
+
+        if (today.getDate() < nextPaymentDate.getDate()) monthsUnpaid--;
+
+        if (monthsUnpaid < 0 && today >= nextPaymentDate) monthsUnpaid = 0;
+        else monthsUnpaid = Math.max(1, monthsUnpaid + 1);
+
+        for (let i = 1; i <= monthsUnpaid; i++) {
+            const monthKey = `m${i}`;
+            let rate = loan.interestMonths[monthKey];
+            if (i > 12 || rate === undefined) {
+                rate = loan.interestMonths.afterValidity;
+            }
+            const monthlyInterest = (loan.currentBalance * rate) / 100;
+            totalInterestDue += monthlyInterest;
+            interestDetails.push({ month: i, rate: rate, amount: monthlyInterest });
+        }
+    }
+
+    if (loan.status !== 'closed' && today > dueDate) {
+        const diffTime = Math.abs(today - dueDate);
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        penalty.daysOverdue = diffDays;
+        penalty.amount = 0;
+        penalty.details = `Overdue by ${diffDays} days. Penalty rate applies to future interest.`;
+    }
+
+    loan.penalty = penalty;
+    loan.calculatedInterest = { monthsUnpaid, totalDue: totalInterestDue, details: interestDetails };
+    loan.payableAmount = loan.currentBalance + totalInterestDue + penalty.amount;
+
+    return loan;
+};
+
 const createLoan = async (req, res) => {
-    const { customerId, schemeId, items, requestedLoanAmount, preInterestAmount, isCustomScheme, customSchemeValues } = req.body;
+    const { customerId, schemeId, items, requestedLoanAmount, preInterestAmount, processingCharges, isCustomScheme, customSchemeValues, renewFromLoanId } = req.body;
 
     try {
         let itemsData;
@@ -75,7 +123,7 @@ const createLoan = async (req, res) => {
             return res.status(404).json({ message: 'Scheme not found' });
         }
 
-        let appliedInterestRate = scheme.interestRate;
+        let appliedInterestMonths = scheme.interestMonths;
         let appliedTenure = scheme.tenureMonths;
         let appliedMaxLoanPercent = scheme.maxLoanPercentage;
 
@@ -92,7 +140,7 @@ const createLoan = async (req, res) => {
             }
 
             if (approvedRequest.proposedValues) {
-                appliedInterestRate = approvedRequest.proposedValues.interestRate;
+                appliedInterestMonths = approvedRequest.proposedValues.interestMonths;
                 appliedTenure = approvedRequest.proposedValues.tenureMonths;
                 if (approvedRequest.proposedValues.maxLoanPercentage) {
                     appliedMaxLoanPercent = approvedRequest.proposedValues.maxLoanPercentage;
@@ -101,6 +149,7 @@ const createLoan = async (req, res) => {
         }
 
         let goldRateObj = await GoldRate.findOne().sort({ rateDate: -1 });
+        let deductionObj = await Deduction.findOne();
 
         if (!goldRateObj || !(goldRateObj.ratePerGram22k > 0 || goldRateObj.ratePerGram20k > 0 || goldRateObj.ratePerGram18k > 0)) {
             console.log("Error: Gold Rate not set");
@@ -108,24 +157,41 @@ const createLoan = async (req, res) => {
             return res.status(400).json({ message: "Gold rate not set by admin" });
         }
 
-
         let totalWeight = 0;
         let totalValuation = 0;
 
+        const deduction22k = deductionObj?.deduction22k || 0;
+        const deductionOrdinary = deductionObj?.deductionOrdinary || 0;
+
+        // Group items by purity to calculate cumulative deduction based on total weight per purity
+        const purityStats = {
+            '22k': { totalWeight: 0, rate: goldRateObj.ratePerGram22k, deduction: deduction22k },
+            '20k': { totalWeight: 0, rate: goldRateObj.ratePerGram20k, deduction: deductionOrdinary },
+            '18k': { totalWeight: 0, rate: goldRateObj.ratePerGram18k, deduction: deductionOrdinary }
+        };
+
         for (const item of itemsData) {
-            totalWeight += parseFloat(item.netWeight);
-            let rate = 0;
-            if (item.purity === '22k') rate = goldRateObj.ratePerGram22k;
-            else if (item.purity === '20k') rate = goldRateObj.ratePerGram20k;
-            else if (item.purity === '18k') rate = goldRateObj.ratePerGram18k;
-
-            if (!rate || rate <= 0) {
-                console.error(`Validation Error: Gold rate for ${item.purity} is missing (Rate: ${rate})`);
-                cleanupFiles(req.files);
-                return res.status(400).json({ message: `Gold rate for ${item.purity} is not set by admin` });
+            const w = parseFloat(item.netWeight) || 0;
+            totalWeight += w;
+            if (purityStats[item.purity]) {
+                purityStats[item.purity].totalWeight += w;
             }
+        }
 
-            totalValuation += parseFloat(item.netWeight) * rate;
+        for (const purity in purityStats) {
+            const stats = purityStats[purity];
+            if (stats.totalWeight > 0) {
+                let currentRate = stats.rate;
+                const totalDeductionPercent = stats.deduction * stats.totalWeight;
+                if (totalDeductionPercent) currentRate -= currentRate * (totalDeductionPercent / 100);
+
+                if (!currentRate || currentRate <= 0) {
+                    console.error(`Validation Error: Effective Gold rate for ${purity} is missing or zero (Rate: ${currentRate})`);
+                    cleanupFiles(req.files);
+                    return res.status(400).json({ message: `Gold rate for ${purity} is not set correctly by admin or deduction exceeds 100%` });
+                }
+                totalValuation += stats.totalWeight * currentRate;
+            }
         }
 
         const maxLoan = totalValuation * (appliedMaxLoanPercent / 100);
@@ -165,8 +231,8 @@ const createLoan = async (req, res) => {
             valuation: totalValuation,
             loanAmount: requestedLoanAmount,
             preInterestAmount: preInterestAmount || 0,
-            interestRate: appliedInterestRate,
-            monthlyInterest: ((requestedLoanAmount * appliedInterestRate) / 100) / appliedTenure,
+            processingCharges: processingCharges || 0,
+            interestMonths: appliedInterestMonths,
             dueDate: dueDate,
             nextPaymentDate: nextPaymentDate,
             createdBy: req.user._id,
@@ -205,6 +271,31 @@ const createLoan = async (req, res) => {
             referenceType: 'Loan'
         });
 
+        // Handle Auto-Settlement of Old Loan if this is a Renewal / Top-up
+        if (renewFromLoanId) {
+            const oldLoan = await Loan.findById(renewFromLoanId);
+            if (oldLoan && oldLoan.status !== 'closed') {
+                const calculatedOldLoan = calculateLoanPayables(oldLoan);
+
+                const settlementPayment = new Payment({
+                    loan: oldLoan._id,
+                    amount: calculatedOldLoan.payableAmount,
+                    type: 'full_settlement',
+                    paymentMode: 'renewal',
+                    collectedBy: req.user._id,
+                    remarks: `Auto-settled via Top-up Loan ${createdLoan.loanId}`
+                });
+                await settlementPayment.save();
+
+                oldLoan.status = 'closed';
+                oldLoan.currentBalance = 0;
+                oldLoan.payableAmount = 0;
+                await oldLoan.save();
+
+                // Track renewal relationship if we wanted to, but the payment remark suffices.
+            }
+        }
+
         res.status(201).json(createdLoan);
 
     } catch (error) {
@@ -234,9 +325,13 @@ const getLoans = async (req, res) => {
             query.status = req.query.status;
         }
 
+        if (req.query.customer) {
+            query.customer = req.query.customer;
+        }
+
         const loans = await Loan.find(query)
             .populate('customer', 'name phone photo')
-            .populate('scheme', 'schemeName interestRate')
+            .populate('scheme', 'schemeName interestMonths')
             .sort({ createdAt: -1 })
             .lean();
 
@@ -295,46 +390,7 @@ const getLoanById = async (req, res) => {
         }
 
         if (loan) {
-            // Dynamic Penalty Calculation
-            const today = new Date();
-            const dueDate = new Date(loan.dueDate);
-
-            let penalty = {
-                details: 'No penalty',
-                amount: 0,
-                daysOverdue: 0
-            };
-
-            // Only calculate if loan is NOT closed and is OVERDUE
-            if (loan.status !== 'closed' && today > dueDate) {
-                const diffTime = Math.abs(today - dueDate);
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-                penalty.daysOverdue = diffDays;
-
-                let penalInterestAmount = 0;
-                let flatFine = 0;
-
-                // 1. Penal Interest (on default principal balance)
-                // If scheme has penalInterestRate (e.g. 6% p.a extra)
-                if (loan.scheme && loan.scheme.penalInterestRate > 0) {
-                    // Calculate extra interest for the overdue period
-                    // Formula: (Balance * PenalRate * (OverdueDays/365)) / 100
-                    const annualPenalRate = loan.scheme.penalInterestRate;
-                    penalInterestAmount = (loan.currentBalance * annualPenalRate * (diffDays / 365)) / 100;
-                }
-
-                // 2. Flat Overdue Fine
-                if (loan.scheme && loan.scheme.overdueFine > 0) {
-                    flatFine = loan.scheme.overdueFine;
-                }
-
-                penalty.amount = Math.ceil(penalInterestAmount + flatFine);
-                penalty.details = `Overdue by ${diffDays} days. Fine: ₹${flatFine}, Penal Interest: ₹${penalInterestAmount.toFixed(2)}`;
-            }
-
-            loan.penalty = penalty;
-            loan.payableAmount = loan.currentBalance + penalty.amount; // Note: This is simplified. Ideally should include accrued normal interest too.
-
+            loan = calculateLoanPayables(loan);
             normalizeLoanPaths(loan);
             res.json(loan);
         }
